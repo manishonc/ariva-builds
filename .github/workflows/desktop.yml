@@ -119,7 +119,7 @@ jobs:
           create_release() {
             local tag="$1" i
             for i in 1 2 3; do
-              create_release "$@" && return 0
+              gh release create "$@" && return 0
               echo "::warning::release create failed (attempt $i); retrying"
               gh release delete "$tag" --repo "$SOURCE_REPO" --yes --cleanup-tag 2>/dev/null || true
               sleep $((i * 15))
