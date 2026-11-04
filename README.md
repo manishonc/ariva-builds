@@ -14,6 +14,19 @@ Ariva Messages is signed with the user's **release keystore** (a default SMS app
 
 Releases always land on the **private** repo. The Android (Expo) APK is signed with the stock Expo debug key (same as local builds), so no signing secret is needed; it is for side-loading, not the Play Store.
 
+## Fast downloads (R2 mirror)
+
+GitHub's release-asset host is throttled on some networks (Airtel India measured 6-26 KB/s while the same line pulls 9 MB/s from Cloudflare). So every build also uploads its main file (`.dmg` / `.apk`) to the private Cloudflare R2 bucket `ariva-builds` under `<target>/<version>/<file>`, via `scripts/r2-mirror.sh`. A **7-day signed link** goes into the private release's notes: a visible "⚡ Fast download" line, and a `<!-- r2 <file> <expires> <url> -->` line the Claude builds pane reads. The links are masked in this repo's public logs and are never written anywhere else. The GitHub release stays the source of truth: the pane falls back to it when a link is missing, expired or broken.
+
+Secrets on this repo (the step skips cleanly without them):
+
+| Secret | What |
+|---|---|
+| `R2_ACCOUNT_ID` | Cloudflare account id |
+| `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 API token, **Object Read & Write on the `ariva-builds` bucket only** (not the app's `ariva-local` / `ariva-prod` keys) |
+
+Optional repo variable `R2_BUCKET` overrides the bucket name. A 30-day lifecycle rule on the bucket keeps it from growing.
+
 ## Naming
 
 Every target follows the same pattern, so releases read the same on every platform:

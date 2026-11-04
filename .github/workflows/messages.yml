@@ -86,6 +86,13 @@ jobs:
           done
           exit $missing
 
+      - name: Check out this runner repo (scripts only)
+        uses: actions/checkout@v4
+        with:
+          path: runner
+          sparse-checkout: scripts
+          persist-credentials: false
+
       - uses: actions/checkout@v4
         with:
           repository: manishonc/ariva
@@ -164,6 +171,18 @@ jobs:
           "$BT/aapt2" dump badging "out/ArivaMessages-$V.apk" | grep -E "^package:" || true
           ls -l out
 
+      - name: Mirror to R2 (fast download link)
+        # Signed 7-day links go into the PRIVATE release's notes only; the
+        # script masks them in this public log. Skips when R2 is not set up.
+        working-directory: src
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ vars.R2_BUCKET || 'ariva-builds' }}
+          V: ${{ steps.version.outputs.version }}
+        run: ../runner/scripts/r2-mirror.sh messages "$V" ../r2-notes.md out/*.apk
+
       - name: Publish to the private repo
         working-directory: src
         env:
@@ -173,9 +192,11 @@ jobs:
         run: |
           ASSETS=(out/*.apk out/*.sha256)
           INSTALL='Download the `.apk` on the phone and open it (allow installs from your browser or Files app once; Android 15 may ask to allow restricted settings). It is signed with the Ariva Messages release key, the same as local builds, so it installs over the current app and keeps the default-SMS role and pairing.'
+          FAST="$(cat ../r2-notes.md 2>/dev/null || true)"
+          if [ -n "$FAST" ]; then FAST=$'\n\n'"$FAST"; fi
           if [ "$KIND" = release ]; then
             gh release create "messages-v$V" "${ASSETS[@]}" --repo "$SOURCE_REPO" \
-              --target "$SHA" --title "Ariva Messages $V" --notes "$INSTALL" --generate-notes
+              --target "$SHA" --title "Ariva Messages $V" --notes "$INSTALL$FAST" --generate-notes
           else
             # Recreate: the tag has to follow main.
             gh release delete messages-latest --repo "$SOURCE_REPO" --yes --cleanup-tag || true
@@ -183,7 +204,7 @@ jobs:
               --target "$SHA" --title "Ariva Messages (latest build)" --prerelease \
               --notes "Automatic build of ${SHA::7}, version $V.
 
-          $INSTALL"
+          $INSTALL$FAST"
           fi
 
       - name: Download link
