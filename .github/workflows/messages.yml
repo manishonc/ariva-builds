@@ -1,0 +1,204 @@
+name: Ariva Messages build
+
+# Builds a signed release APK of Ariva Messages, the native Kotlin default-SMS
+# app (apps/messaging/android, package com.manishonc.ariva.messages), from the
+# private manishonc/ariva repo. This repo is public only so GitHub-hosted
+# runner minutes are free; it holds no app code. The finished APK is published
+# as a release on the PRIVATE repo, never here.
+#
+# Same recipe as the private repo's build-messaging-apk skill:
+# :domain:test, then :app:assembleRelease, signed from the ARIVA_MESSAGES_*
+# env that app/build.gradle.kts reads.
+#
+# Signing: the user's own release keystore, the SAME key the APK on the phone
+# was signed with. A default SMS app must never be "updated" by an APK signed
+# with any other key, and Android refuses one anyway. The keystore arrives
+# base64'd in a secret, is decoded to $RUNNER_TEMP for the build only, and is
+# deleted afterwards; nothing here prints it or its passwords.
+#
+#   secrets.ARIVA_MESSAGES_KEYSTORE_B64       base64 of the .jks / PKCS12 file
+#   secrets.ARIVA_MESSAGES_KEYSTORE_PASSWORD  its store password
+#   secrets.ARIVA_MESSAGES_KEY_ALIAS          the key alias
+#   secrets.ARIVA_MESSAGES_KEY_PASSWORD       the key password
+#   vars.ARIVA_MESSAGES_CERT_SHA256           optional: expected signer SHA-256
+#                                             (hex, no colons); the build fails
+#                                             if the APK is signed by anything else
+#   vars.ARIVA_FCM_{APP_ID,PROJECT_ID,API_KEY,SENDER_ID}
+#                                             optional FCM client config (not
+#                                             secret); unset = push off
+#
+# Triggered by the private repo (repository_dispatch) or by hand (Run workflow).
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: 'latest = rolling messages-latest prerelease, release = versioned'
+        type: choice
+        options: [latest, release]
+        default: latest
+      ref:
+        description: 'Branch, tag or SHA of manishonc/ariva to build'
+        default: main
+      version:
+        description: 'Release only: version without v, e.g. 0.2.0'
+        required: false
+  repository_dispatch:
+    types: [messages-build]
+
+concurrency:
+  group: messages-${{ github.event.inputs.kind || github.event.client_payload.kind || 'latest' }}
+  cancel-in-progress: ${{ (github.event.inputs.kind || github.event.client_payload.kind || 'latest') == 'latest' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Inputs go through env + validation, never straight into shell text.
+      KIND: ${{ github.event.inputs.kind || github.event.client_payload.kind }}
+      REF: ${{ github.event.inputs.ref || github.event.client_payload.ref }}
+      VERSION_IN: ${{ github.event.inputs.version || github.event.client_payload.version }}
+      SOURCE_REPO: manishonc/ariva
+    steps:
+      - name: Validate inputs
+        run: |
+          [[ "$KIND" =~ ^(latest|release)$ ]] || { echo "bad kind"; exit 1; }
+          [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "bad ref"; exit 1; }
+          if [ "$KIND" = release ]; then
+            [[ "$VERSION_IN" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad version"; exit 1; }
+          fi
+
+      - name: Signing secrets are present
+        # Fail in seconds, not after the build: without them Gradle leaves the
+        # APK unsigned (it is never debug-signed). Only presence is checked.
+        env:
+          KS_B64: ${{ secrets.ARIVA_MESSAGES_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.ARIVA_MESSAGES_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ARIVA_MESSAGES_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ARIVA_MESSAGES_KEY_PASSWORD }}
+        run: |
+          missing=0
+          for v in KS_B64 KS_PASS KEY_ALIAS KEY_PASS; do
+            [ -n "${!v}" ] || { echo "::error::signing secret for $v is not set on this repo"; missing=1; }
+          done
+          exit $missing
+
+      - uses: actions/checkout@v4
+        with:
+          repository: manishonc/ariva
+          ref: ${{ env.REF }}
+          token: ${{ secrets.ARIVA_SOURCE_TOKEN }}
+          path: src
+          # Nothing here pushes; keep the token out of src/.git/config.
+          persist-credentials: false
+
+      - uses: gradle/actions/wrapper-validation@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Stamp version
+        id: version
+        working-directory: src/apps/messaging/android
+        run: |
+          SHA="$(git -C "$GITHUB_WORKSPACE/src" rev-parse HEAD)"
+          BASE="$(grep -E '^\s*versionName *= *"' app/build.gradle.kts | head -1 | sed -E 's/.*"(.*)".*/\1/')"
+          [[ "$BASE" =~ ^[0-9A-Za-z.+-]+$ ]] || { echo "could not read versionName"; exit 1; }
+          if [ "$KIND" = release ]; then V="$VERSION_IN"; else V="$BASE-dev.${SHA::7}"; fi
+          # versionName only; versionCode stays as the source has it, so CI
+          # and local builds keep installing over each other.
+          sed -i -E "0,/^(\s*versionName *= *)\"[^\"]*\"/s//\1\"$V\"/" app/build.gradle.kts
+          grep -E '^\s*version(Name|Code) *=' app/build.gradle.kts
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Unit tests and signed release build
+        working-directory: src/apps/messaging/android
+        env:
+          KS_B64: ${{ secrets.ARIVA_MESSAGES_KEYSTORE_B64 }}
+          ARIVA_MESSAGES_KEYSTORE_PASSWORD: ${{ secrets.ARIVA_MESSAGES_KEYSTORE_PASSWORD }}
+          ARIVA_MESSAGES_KEY_ALIAS: ${{ secrets.ARIVA_MESSAGES_KEY_ALIAS }}
+          ARIVA_MESSAGES_KEY_PASSWORD: ${{ secrets.ARIVA_MESSAGES_KEY_PASSWORD }}
+          ARIVA_FCM_APP_ID: ${{ vars.ARIVA_FCM_APP_ID }}
+          ARIVA_FCM_PROJECT_ID: ${{ vars.ARIVA_FCM_PROJECT_ID }}
+          ARIVA_FCM_API_KEY: ${{ vars.ARIVA_FCM_API_KEY }}
+          ARIVA_FCM_SENDER_ID: ${{ vars.ARIVA_FCM_SENDER_ID }}
+        run: |
+          export ARIVA_MESSAGES_KEYSTORE="$RUNNER_TEMP/ariva-messages.jks"
+          trap 'rm -f "$ARIVA_MESSAGES_KEYSTORE"' EXIT
+          printf '%s' "$KS_B64" | base64 -d > "$ARIVA_MESSAGES_KEYSTORE"
+          unset KS_B64
+          [ -s "$ARIVA_MESSAGES_KEYSTORE" ] || { echo "::error::keystore secret did not decode"; exit 1; }
+          ./gradlew --no-daemon --stacktrace :domain:test :app:assembleRelease
+          if [ -n "$ARIVA_FCM_APP_ID" ]; then echo "Push: on"; else echo "Push: off (no ARIVA_FCM_* vars)"; fi
+
+      - name: Collect APK
+        working-directory: src
+        env:
+          V: ${{ steps.version.outputs.version }}
+          WANT_CERT: ${{ vars.ARIVA_MESSAGES_CERT_SHA256 }}
+        run: |
+          APK=apps/messaging/android/app/build/outputs/apk/release/app-release.apk
+          [ -s "$APK" ] || { echo "::error::no signed APK (an app-release-unsigned.apk means signing was skipped)"; ls -l "$(dirname "$APK")" || true; exit 1; }
+          mkdir -p out
+          cp "$APK" "out/ArivaMessages-$V.apk"
+          (cd out && sha256sum "ArivaMessages-$V.apk" > "ArivaMessages-$V.apk.sha256" && cat "ArivaMessages-$V.apk.sha256")
+          # Signer, so a key change shows (and, with the pin set, fails) here.
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          CERTS="$("$BT/apksigner" verify --print-certs "out/ArivaMessages-$V.apk" 2>&1)" \
+            || { echo "::error::APK signature does not verify"; exit 1; }
+          echo "$CERTS" | grep -E 'certificate (DN|SHA-256)'
+          GOT="$(echo "$CERTS" | grep -m1 'Signer #1 certificate SHA-256 digest' | awk '{print $NF}')"
+          if [ -n "$WANT_CERT" ]; then
+            WANT="$(echo "$WANT_CERT" | tr -d ': ' | tr 'A-F' 'a-f')"
+            [ "$GOT" = "$WANT" ] || { echo "::error::APK is signed by $GOT, expected $WANT"; exit 1; }
+            echo "Signer matches the pinned certificate."
+          fi
+          "$BT/aapt2" dump badging "out/ArivaMessages-$V.apk" | grep -E "^package:" || true
+          ls -l out
+
+      - name: Publish to the private repo
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ secrets.ARIVA_SOURCE_TOKEN }}
+          V: ${{ steps.version.outputs.version }}
+          SHA: ${{ steps.version.outputs.sha }}
+        run: |
+          ASSETS=(out/*.apk out/*.sha256)
+          INSTALL='Download the `.apk` on the phone and open it (allow installs from your browser or Files app once; Android 15 may ask to allow restricted settings). It is signed with the Ariva Messages release key, the same as local builds, so it installs over the current app and keeps the default-SMS role and pairing.'
+          if [ "$KIND" = release ]; then
+            gh release create "messages-v$V" "${ASSETS[@]}" --repo "$SOURCE_REPO" \
+              --target "$SHA" --title "Ariva Messages $V" --notes "$INSTALL" --generate-notes
+          else
+            # Recreate: the tag has to follow main.
+            gh release delete messages-latest --repo "$SOURCE_REPO" --yes --cleanup-tag || true
+            gh release create messages-latest "${ASSETS[@]}" --repo "$SOURCE_REPO" \
+              --target "$SHA" --title "Ariva Messages (latest build)" --prerelease \
+              --notes "Automatic build of ${SHA::7}, version $V.
+
+          $INSTALL"
+          fi
+
+      - name: Download link
+        # The GitHub Mobile "workflow run" push opens this run; put the APK
+        # one tap away. The links need GitHub sign-in (the repo is private),
+        # so they are safe to show in this public log.
+        env:
+          V: ${{ steps.version.outputs.version }}
+        run: |
+          if [ "$KIND" = release ]; then TAG="messages-v$V"; else TAG=messages-latest; fi
+          APK_URL="https://github.com/$SOURCE_REPO/releases/download/$TAG/ArivaMessages-$V.apk"
+          PAGE_URL="https://github.com/$SOURCE_REPO/releases/tag/$TAG"
+          echo "::notice title=Ariva Messages $V APK ready::$APK_URL"
+          {
+            echo "## ⬇️ [Download ArivaMessages-$V.apk]($APK_URL)"
+            echo
+            echo "Release page: [$TAG]($PAGE_URL)"
+          } >> "$GITHUB_STEP_SUMMARY"
