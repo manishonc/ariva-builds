@@ -1,0 +1,173 @@
+name: Android build
+
+# Builds the Android APK of the React Native / Expo app (apps/mobile) from the
+# private manishonc/ariva repo. This repo is public only so GitHub-hosted
+# runner minutes are free; it holds no app code. The finished APK is
+# published as a release on the PRIVATE repo, never here.
+#
+# Same pipeline as the private repo's build-mobile-apk skill: bun install ->
+# expo prebuild -> gradlew assembleRelease, on JDK 17 + the runner's Android SDK.
+#
+# Signing: the release APK is signed with the stock Expo/React Native debug
+# keystore that `expo prebuild` writes (the same public key every local build
+# uses), so CI builds and local builds install over each other. It is fine for
+# side-loading, not for the Play Store.
+#
+# Triggered by the private repo (repository_dispatch) or by hand (Run workflow).
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: 'latest = rolling android-latest prerelease, release = versioned'
+        type: choice
+        options: [latest, release]
+        default: latest
+      ref:
+        description: 'Branch, tag or SHA of manishonc/ariva to build'
+        default: main
+      version:
+        description: 'Release only: version without v, e.g. 1.1.0'
+        required: false
+  repository_dispatch:
+    types: [android-build]
+
+concurrency:
+  group: android-${{ github.event.inputs.kind || github.event.client_payload.kind || 'latest' }}
+  cancel-in-progress: ${{ (github.event.inputs.kind || github.event.client_payload.kind || 'latest') == 'latest' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Inputs go through env + validation, never straight into shell text.
+      KIND: ${{ github.event.inputs.kind || github.event.client_payload.kind }}
+      REF: ${{ github.event.inputs.ref || github.event.client_payload.ref }}
+      VERSION_IN: ${{ github.event.inputs.version || github.event.client_payload.version }}
+      SOURCE_REPO: manishonc/ariva
+    steps:
+      - name: Validate inputs
+        run: |
+          [[ "$KIND" =~ ^(latest|release)$ ]] || { echo "bad kind"; exit 1; }
+          [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "bad ref"; exit 1; }
+          if [ "$KIND" = release ]; then
+            [[ "$VERSION_IN" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad version"; exit 1; }
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: manishonc/ariva
+          ref: ${{ env.REF }}
+          token: ${{ secrets.ARIVA_SOURCE_TOKEN }}
+          path: src
+          # Nothing here pushes; keep the token out of src/.git/config.
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install
+        working-directory: src
+        run: bun install --frozen-lockfile
+
+      - name: Expo native modules are on the SDK line
+        # The `expo install --check` gotcha: an expo-* package a MAJOR version
+        # off the SDK (expo-font ~14 on SDK 57) compiles fine and crashes at
+        # launch. Patch drift inside the SDK line is harmless, so only a major
+        # mismatch fails the build.
+        working-directory: src/apps/mobile
+        run: |
+          node -e '
+            const want = require("./node_modules/expo/bundledNativeModules.json");
+            const deps = require("./package.json").dependencies || {};
+            const major = (s) => String(s).replace(/^[^0-9]*/, "").split(".")[0];
+            let bad = 0;
+            for (const name of Object.keys(deps)) {
+              if (!want[name]) continue;
+              let got;
+              try { got = require(`./node_modules/${name}/package.json`).version; } catch { continue; }
+              if (major(got) !== major(want[name])) {
+                console.log(`::error::${name} ${got} is off the Expo SDK line (expects ${want[name]}); run bunx expo install --check`);
+                bad++;
+              }
+            }
+            if (bad) process.exit(1);
+            console.log("expo native modules OK");
+          '
+
+      - name: Stamp version
+        id: version
+        working-directory: src
+        run: |
+          SHA="$(git rev-parse HEAD)"
+          BASE="$(node -p "require('./apps/mobile/app.json').expo.version")"
+          if [ "$KIND" = release ]; then V="$VERSION_IN"; else V="$BASE-dev.${SHA::7}"; fi
+          # versionName only; versionCode stays as app.json has it, so CI and
+          # local builds keep installing over each other.
+          V="$V" node -e "
+            const fs=require('fs'), p='apps/mobile/app.json';
+            const j=JSON.parse(fs.readFileSync(p,'utf8'));
+            j.expo.version=process.env.V;
+            fs.writeFileSync(p, JSON.stringify(j,null,2)+'\n');"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Expo prebuild
+        working-directory: src/apps/mobile
+        run: bunx expo prebuild --platform android --no-install
+
+      - name: Gradle release build
+        working-directory: src/apps/mobile/android
+        run: ./gradlew --no-daemon assembleRelease
+
+      - name: Collect APK
+        working-directory: src
+        env:
+          V: ${{ steps.version.outputs.version }}
+        run: |
+          APK=apps/mobile/android/app/build/outputs/apk/release/app-release.apk
+          [ -f "$APK" ] || { echo "no APK at $APK"; exit 1; }
+          mkdir -p out
+          mv "$APK" "out/Ariva-$V.apk"
+          (cd out && sha256sum "Ariva-$V.apk" > "Ariva-$V.apk.sha256")
+          # Signer fingerprint, so a key change is visible in the log.
+          "$ANDROID_HOME"/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)/apksigner \
+            verify --print-certs "out/Ariva-$V.apk" | grep -E 'SHA-256|DN' || true
+          ls -l out
+
+      - name: Publish to the private repo
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ secrets.ARIVA_SOURCE_TOKEN }}
+          V: ${{ steps.version.outputs.version }}
+          SHA: ${{ steps.version.outputs.sha }}
+        run: |
+          ASSETS=(out/*.apk out/*.sha256)
+          INSTALL='Download the `.apk` on the phone and open it (allow installs from your browser or Files app once). It is signed with the standard Expo debug key, the same as local builds, so it installs over an existing Ariva build.'
+          if [ "$KIND" = release ]; then
+            gh release create "android-v$V" "${ASSETS[@]}" --repo "$SOURCE_REPO" \
+              --target "$SHA" --title "Ariva Android $V" --notes "$INSTALL" --generate-notes
+          else
+            # Recreate: the tag has to follow main.
+            gh release delete android-latest --repo "$SOURCE_REPO" --yes --cleanup-tag || true
+            gh release create android-latest "${ASSETS[@]}" --repo "$SOURCE_REPO" \
+              --target "$SHA" --title "Ariva Android (latest build)" --prerelease \
+              --notes "Automatic build of ${SHA::7}, version $V.
+
+          $INSTALL"
+          fi
