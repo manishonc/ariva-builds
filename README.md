@@ -11,4 +11,20 @@ Secret needed: `ARIVA_SOURCE_TOKEN` — fine-grained PAT on `manishonc/ariva` (c
 
 Releases always land on the **private** repo. The Android APK is signed with the stock Expo debug key (same as local builds), so no signing secret is needed; it is for side-loading, not the Play Store.
 
-Add new build targets as more workflows here.
+## Naming
+
+Every target follows the same pattern, so releases read the same on every platform:
+
+| Thing | Pattern | macOS | Android |
+|---|---|---|---|
+| Workflow file | `<target>.yml` | `desktop.yml` | `android.yml` |
+| Workflow name | `Ariva <Platform> build` | Ariva macOS build | Ariva Android build |
+| Dispatch event | `<target>-build` | `desktop-build` | `android-build` |
+| Rolling tag (prerelease) | `<target>-latest` | `desktop-latest` | `android-latest` |
+| Rolling title | `Ariva <Platform> (latest build)` | Ariva macOS (latest build) | Ariva Android (latest build) |
+| Versioned tag | `<target>-v<version>` | `desktop-v0.3.0` | `android-v1.1.0` |
+| Versioned title | `Ariva <Platform> <version>` | Ariva macOS 0.3.0 | Ariva Android 1.1.0 |
+
+`<Platform>` is the platform's proper name (macOS, Android, Windows, iOS, Linux), never a bare "Ariva". Tags keep the short target slug because links and updaters point at them; don't rename an existing tag.
+
+Add new build targets as more workflows here, following the table.

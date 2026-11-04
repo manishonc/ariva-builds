@@ -1,4 +1,4 @@
-name: Android build
+name: Ariva Android build
 
 # Builds the Android APK of the React Native / Expo app (apps/mobile) from the
 # private manishonc/ariva repo. This repo is public only so GitHub-hosted

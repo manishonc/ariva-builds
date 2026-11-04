@@ -1,4 +1,4 @@
-name: Desktop build
+name: Ariva macOS build
 
 # Builds the macOS app from the private manishonc/ariva repo. This repo is
 # public only so GitHub-hosted macOS runners are free; it holds no app code.
@@ -103,12 +103,12 @@ jobs:
           ```'
           if [ "$KIND" = release ]; then
             gh release create "desktop-v$V" "${ASSETS[@]}" --repo "$SOURCE_REPO" \
-              --target "$SHA" --title "Ariva $V" --notes "$INSTALL" --generate-notes
+              --target "$SHA" --title "Ariva macOS $V" --notes "$INSTALL" --generate-notes
           else
             # Recreate: the tag has to follow main.
             gh release delete desktop-latest --repo "$SOURCE_REPO" --yes --cleanup-tag || true
             gh release create desktop-latest "${ASSETS[@]}" --repo "$SOURCE_REPO" \
-              --target "$SHA" --title "Ariva (latest build)" --prerelease \
+              --target "$SHA" --title "Ariva macOS (latest build)" --prerelease \
               --notes "Automatic build of ${SHA::7}, version $V.
 
           $INSTALL"
