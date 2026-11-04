@@ -5,13 +5,23 @@ name: Ariva Android build
 # runner minutes are free; it holds no app code. The finished APK is
 # published as a release on the PRIVATE repo, never here.
 #
-# Same pipeline as the private repo's build-mobile-apk skill: bun install ->
-# expo prebuild -> gradlew assembleRelease, on JDK 17 + the runner's Android SDK.
+# Two paths, picked by the Expo native fingerprint (@expo/fingerprint hashes
+# native deps, app.json, config plugins and native files):
 #
-# Signing: the release APK is signed with the stock Expo/React Native debug
-# keystore that `expo prebuild` writes (the same public key every local build
-# uses), so CI builds and local builds install over each other. It is fine for
-# side-loading, not for the Play Store.
+#   * fingerprint unchanged (a JS/TS-only change, most pushes): REPACK. Take
+#     the APK on android-latest, re-bundle the JS into it with
+#     @expo/repack-app and re-sign. No Gradle, no C++.
+#   * fingerprint changed, no usable base, or `full` asked for: FULL build,
+#     same recipe as the build-mobile-apk skill (bun install -> expo prebuild
+#     -> gradlew assembleRelease), arm64-v8a only, with ccache.
+#
+# The fingerprint travels with the APK as the `native-fingerprint.txt` asset
+# of the release, so the private repo's release is the only build cache that
+# holds app code.
+#
+# Signing: the stock Expo/React Native debug keystore (the one `expo prebuild`
+# writes and @expo/repack-app ships; same public key as local builds), so CI
+# and local builds install over each other. For side-loading, not the Play Store.
 #
 # Triggered by the private repo (repository_dispatch) or by hand (Run workflow).
 on:
@@ -28,6 +38,10 @@ on:
       version:
         description: 'Release only: version without v, e.g. 1.1.0'
         required: false
+      full:
+        description: 'Force a full native build (skip the JS-only repack)'
+        type: boolean
+        default: false
   repository_dispatch:
     types: [android-build]
 
@@ -47,12 +61,18 @@ jobs:
       KIND: ${{ github.event.inputs.kind || github.event.client_payload.kind }}
       REF: ${{ github.event.inputs.ref || github.event.client_payload.ref }}
       VERSION_IN: ${{ github.event.inputs.version || github.event.client_payload.version }}
+      FULL_IN: ${{ github.event.inputs.full || github.event.client_payload.full }}
       SOURCE_REPO: manishonc/ariva
+      # Bump when the native recipe below changes (ABIs, Gradle flags): it is
+      # part of the fingerprint, so the next build is a full one.
+      RECIPE: arm64-r1
+      ABIS: arm64-v8a
     steps:
       - name: Validate inputs
         run: |
           [[ "$KIND" =~ ^(latest|release)$ ]] || { echo "bad kind"; exit 1; }
           [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "bad ref"; exit 1; }
+          [[ "$FULL_IN" =~ ^(true|false)?$ ]] || { echo "bad full"; exit 1; }
           if [ "$KIND" = release ]; then
             [[ "$VERSION_IN" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad version"; exit 1; }
           fi
@@ -78,8 +98,6 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
-
-      - uses: gradle/actions/setup-gradle@v4
 
       - name: Install
         working-directory: src
@@ -110,6 +128,33 @@ jobs:
             console.log("expo native modules OK");
           '
 
+      - name: Native fingerprint and the path to take
+        # Before "Stamp version": the stamp edits app.json, which is part of
+        # the fingerprint.
+        id: path
+        working-directory: src/apps/mobile
+        env:
+          GH_TOKEN: ${{ secrets.ARIVA_SOURCE_TOKEN }}
+        run: |
+          # 0.20.5 is the version Expo SDK 57 itself depends on. Android only,
+          # so an iOS-only native change does not force an Android rebuild.
+          HASH="$(bunx @expo/fingerprint@0.20.5 fingerprint:generate --platform android | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).hash))')"
+          [[ "$HASH" =~ ^[0-9a-f]{40}$ ]] || { echo "fingerprint failed"; exit 1; }
+          KEY="$HASH-$RECIPE"
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+          echo "Native fingerprint: $KEY"
+
+          MODE=full; WHY="asked for"
+          if [ "$FULL_IN" != true ]; then
+            BASE="$(gh release download android-latest --repo "$SOURCE_REPO" \
+              --pattern native-fingerprint.txt --output - 2>/dev/null || true)"
+            if [ -z "$BASE" ]; then WHY="no base build on android-latest"
+            elif [ "$BASE" != "$KEY" ]; then WHY="native changes since the base build ($BASE)"
+            else MODE=repack; WHY="native fingerprint unchanged"; fi
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Build path: $MODE::$WHY"
+
       - name: Stamp version
         id: version
         working-directory: src
@@ -127,28 +172,90 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
+      # ---- repack path -------------------------------------------------------
+
+      - name: Repack the base APK with the new JS
+        if: steps.path.outputs.mode == 'repack'
+        working-directory: src/apps/mobile
+        env:
+          GH_TOKEN: ${{ secrets.ARIVA_SOURCE_TOKEN }}
+          V: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p ../../out base
+          gh release download android-latest --repo "$SOURCE_REPO" --pattern '*.apk' --dir base
+          SRC="$(ls base/*.apk | head -1)"
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          # No --ks: @expo/repack-app signs with its bundled debug keystore,
+          # byte-identical to the one prebuild writes.
+          bunx @expo/repack-app@0.10.4 --platform android --source-app "$SRC" \
+            --android-build-tools-dir "$BT" --output "../../out/Ariva-$V.apk" .
+
+      # ---- full path ---------------------------------------------------------
+
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.path.outputs.mode == 'full'
+
+      - name: ccache
+        if: steps.path.outputs.mode == 'full'
+        run: |
+          sudo apt-get install -y -qq ccache >/dev/null
+          {
+            echo "CCACHE_DIR=$HOME/.ccache"
+            echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"
+            echo "CCACHE_COMPILERCHECK=content"
+            echo "CCACHE_NOHASHDIR=true"
+            echo "CCACHE_MAXSIZE=2G"
+            # Every CMake build (libraries too, not only the app's own CMake,
+            # which already honours ccache) goes through it.
+            echo "CMAKE_C_COMPILER_LAUNCHER=ccache"
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        if: steps.path.outputs.mode == 'full'
+        with:
+          path: ~/.ccache
+          key: ccache-android-${{ env.RECIPE }}-${{ steps.path.outputs.key }}
+          restore-keys: ccache-android-${{ env.RECIPE }}-
+
       - name: Expo prebuild
+        if: steps.path.outputs.mode == 'full'
         working-directory: src/apps/mobile
         run: bunx expo prebuild --platform android --no-install
 
-      - name: Gradle release build
+      - name: Gradle release build (arm64-v8a)
+        if: steps.path.outputs.mode == 'full'
         working-directory: src/apps/mobile/android
-        run: ./gradlew --no-daemon assembleRelease
+        env:
+          V: ${{ steps.version.outputs.version }}
+        run: |
+          # arm64-v8a only: every phone from the last decade and Apple Silicon
+          # emulators; drops x86/x86_64/armeabi-v7a and three quarters of the
+          # C++ compile. Release lint (lintVital*) is skipped: it is a
+          # Play-upload gate, not a build step we need for side-loading.
+          ./gradlew --no-daemon assembleRelease \
+            -PreactNativeArchitectures="$ABIS" \
+            -x lintVitalAnalyzeRelease -x lintVitalReportRelease -x lintVitalRelease
+          mkdir -p ../../../out
+          mv app/build/outputs/apk/release/app-release.apk "../../../out/Ariva-$V.apk"
+          ccache --show-stats || true
+
+      # ---- both paths --------------------------------------------------------
 
       - name: Collect APK
         working-directory: src
         env:
           V: ${{ steps.version.outputs.version }}
+          KEY: ${{ steps.path.outputs.key }}
         run: |
-          APK=apps/mobile/android/app/build/outputs/apk/release/app-release.apk
-          [ -f "$APK" ] || { echo "no APK at $APK"; exit 1; }
-          mkdir -p out
-          mv "$APK" "out/Ariva-$V.apk"
+          [ -s "out/Ariva-$V.apk" ] || { echo "no APK at out/Ariva-$V.apk"; exit 1; }
           (cd out && sha256sum "Ariva-$V.apk" > "Ariva-$V.apk.sha256")
-          # Signer fingerprint, so a key change is visible in the log.
-          BT="$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
-          "$ANDROID_HOME/build-tools/$BT/apksigner" verify --print-certs "out/Ariva-$V.apk" 2>&1 \
-            | grep -E 'certificate (DN|SHA-256)' || echo "::warning::apksigner could not read the signer"
+          printf '%s' "$KEY" > out/native-fingerprint.txt
+          # Signer, version and ABIs, so a key change or a bad repack shows here.
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          "$BT/apksigner" verify --print-certs "out/Ariva-$V.apk" 2>&1 \
+            | grep -E 'certificate (DN|SHA-256)' || { echo "::error::APK signature does not verify"; exit 1; }
+          "$BT/aapt2" dump badging "out/Ariva-$V.apk" | grep -E "^package:|^native-code:" || true
           ls -l out
 
       - name: Publish to the private repo
@@ -157,18 +264,20 @@ jobs:
           GH_TOKEN: ${{ secrets.ARIVA_SOURCE_TOKEN }}
           V: ${{ steps.version.outputs.version }}
           SHA: ${{ steps.version.outputs.sha }}
+          MODE: ${{ steps.path.outputs.mode }}
         run: |
-          ASSETS=(out/*.apk out/*.sha256)
-          INSTALL='Download the `.apk` on the phone and open it (allow installs from your browser or Files app once). It is signed with the standard Expo debug key, the same as local builds, so it installs over an existing Ariva build.'
+          ASSETS=(out/*.apk out/*.sha256 out/native-fingerprint.txt)
+          INSTALL='Download the `.apk` on the phone and open it (allow installs from your browser or Files app once). It is signed with the standard Expo debug key, the same as local builds, so it installs over an existing Ariva build. arm64 only.'
+          if [ "$MODE" = repack ]; then HOW="JS-only change: repacked onto the previous native build."; else HOW="Full native build."; fi
           if [ "$KIND" = release ]; then
             gh release create "android-v$V" "${ASSETS[@]}" --repo "$SOURCE_REPO" \
-              --target "$SHA" --title "Ariva Android $V" --notes "$INSTALL" --generate-notes
+              --target "$SHA" --title "Ariva Android $V" --notes "$HOW $INSTALL" --generate-notes
           else
             # Recreate: the tag has to follow main.
             gh release delete android-latest --repo "$SOURCE_REPO" --yes --cleanup-tag || true
             gh release create android-latest "${ASSETS[@]}" --repo "$SOURCE_REPO" \
               --target "$SHA" --title "Ariva Android (latest build)" --prerelease \
-              --notes "Automatic build of ${SHA::7}, version $V.
+              --notes "Automatic build of ${SHA::7}, version $V. $HOW
 
           $INSTALL"
           fi
@@ -179,13 +288,14 @@ jobs:
         # so they are safe to show in this public log.
         env:
           V: ${{ steps.version.outputs.version }}
+          MODE: ${{ steps.path.outputs.mode }}
         run: |
           if [ "$KIND" = release ]; then TAG="android-v$V"; else TAG=android-latest; fi
           APK_URL="https://github.com/$SOURCE_REPO/releases/download/$TAG/Ariva-$V.apk"
           PAGE_URL="https://github.com/$SOURCE_REPO/releases/tag/$TAG"
-          echo "::notice title=Ariva Android $V APK ready::$APK_URL"
+          echo "::notice title=Ariva Android $V APK ready ($MODE)::$APK_URL"
           {
             echo "## ⬇️ [Download Ariva-$V.apk]($APK_URL)"
             echo
-            echo "Release page: [$TAG]($PAGE_URL)"
+            echo "Release page: [$TAG]($PAGE_URL) · build path: **$MODE**"
           } >> "$GITHUB_STEP_SUMMARY"
