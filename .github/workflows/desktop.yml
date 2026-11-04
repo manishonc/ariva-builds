@@ -1,0 +1,115 @@
+name: Desktop build
+
+# Builds the macOS app from the private manishonc/ariva repo. This repo is
+# public only so GitHub-hosted macOS runners are free; it holds no app code.
+# The finished DMG/zip are published as a release on the PRIVATE repo, never here.
+#
+# Triggered by the private repo (repository_dispatch) or by hand (Run workflow).
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: 'latest = rolling desktop-latest prerelease, release = versioned'
+        type: choice
+        options: [latest, release]
+        default: latest
+      ref:
+        description: 'Branch, tag or SHA of manishonc/ariva to build'
+        default: main
+      version:
+        description: 'Release only: version without v, e.g. 0.3.0'
+        required: false
+  repository_dispatch:
+    types: [desktop-build]
+
+concurrency:
+  group: desktop-${{ github.event.inputs.kind || github.event.client_payload.kind || 'latest' }}
+  cancel-in-progress: ${{ (github.event.inputs.kind || github.event.client_payload.kind || 'latest') == 'latest' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      # Inputs go through env + validation, never straight into shell text.
+      KIND: ${{ github.event.inputs.kind || github.event.client_payload.kind }}
+      REF: ${{ github.event.inputs.ref || github.event.client_payload.ref }}
+      VERSION_IN: ${{ github.event.inputs.version || github.event.client_payload.version }}
+      SOURCE_REPO: manishonc/ariva
+    steps:
+      - name: Validate inputs
+        run: |
+          [[ "$KIND" =~ ^(latest|release)$ ]] || { echo "bad kind"; exit 1; }
+          [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "bad ref"; exit 1; }
+          if [ "$KIND" = release ]; then
+            [[ "$VERSION_IN" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad version"; exit 1; }
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: manishonc/ariva
+          ref: ${{ env.REF }}
+          token: ${{ secrets.ARIVA_SOURCE_TOKEN }}
+          path: src
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install
+        working-directory: src
+        run: bun install --frozen-lockfile
+
+      - name: Rebuild native modules for Electron
+        working-directory: src
+        run: bun run --cwd apps/desktop rebuild
+
+      - name: Stamp version
+        id: version
+        working-directory: src
+        run: |
+          SHA="$(git rev-parse HEAD)"
+          BASE="$(node -p "require('./apps/desktop/package.json').version")"
+          if [ "$KIND" = release ]; then V="$VERSION_IN"; else V="$BASE-dev.${SHA::7}"; fi
+          V="$V" node -e "
+            const fs=require('fs'), p='apps/desktop/package.json';
+            const pkg=JSON.parse(fs.readFileSync(p,'utf8'));
+            pkg.version=process.env.V;
+            fs.writeFileSync(p, JSON.stringify(pkg,null,2)+'\n');"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Build and package
+        # Ad-hoc signed. Add APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD /
+        # APPLE_TEAM_ID as secrets of THIS repo (env here) to sign + notarize.
+        working-directory: src
+        run: bun run --cwd apps/desktop package
+
+      - name: Publish to the private repo
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ secrets.ARIVA_SOURCE_TOKEN }}
+          V: ${{ steps.version.outputs.version }}
+          SHA: ${{ steps.version.outputs.sha }}
+        run: |
+          ASSETS=(apps/desktop/release/*.dmg apps/desktop/release/*.zip)
+          INSTALL='Download the `.dmg`, drag **Ariva** to Applications. The build is ad-hoc signed, so clear quarantine once:
+
+          ```bash
+          xattr -dr com.apple.quarantine "/Applications/Ariva.app"
+          ```'
+          if [ "$KIND" = release ]; then
+            gh release create "desktop-v$V" "${ASSETS[@]}" --repo "$SOURCE_REPO" \
+              --target "$SHA" --title "Ariva $V" --notes "$INSTALL" --generate-notes
+          else
+            # Recreate: the tag has to follow main.
+            gh release delete desktop-latest --repo "$SOURCE_REPO" --yes --cleanup-tag || true
+            gh release create desktop-latest "${ASSETS[@]}" --repo "$SOURCE_REPO" \
+              --target "$SHA" --title "Ariva (latest build)" --prerelease \
+              --notes "Automatic build of ${SHA::7}, version $V.
+
+          $INSTALL"
+          fi
