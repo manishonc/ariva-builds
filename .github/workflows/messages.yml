@@ -155,7 +155,7 @@ jobs:
           CERTS="$("$BT/apksigner" verify --print-certs "out/ArivaMessages-$V.apk" 2>&1)" \
             || { echo "::error::APK signature does not verify"; exit 1; }
           echo "$CERTS" | grep -E 'certificate (DN|SHA-256)'
-          GOT="$(echo "$CERTS" | grep -m1 'Signer #1 certificate SHA-256 digest' | awk '{print $NF}')"
+          GOT="$(echo "$CERTS" | grep -m1 -E 'certificate SHA-256 digest:' | awk '{print $NF}')"
           if [ -n "$WANT_CERT" ]; then
             WANT="$(echo "$WANT_CERT" | tr -d ': ' | tr 'A-F' 'a-f')"
             [ "$GOT" = "$WANT" ] || { echo "::error::APK is signed by $GOT, expected $WANT"; exit 1; }
