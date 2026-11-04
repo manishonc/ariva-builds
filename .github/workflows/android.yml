@@ -146,8 +146,9 @@ jobs:
           mv "$APK" "out/Ariva-$V.apk"
           (cd out && sha256sum "Ariva-$V.apk" > "Ariva-$V.apk.sha256")
           # Signer fingerprint, so a key change is visible in the log.
-          "$ANDROID_HOME"/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)/apksigner \
-            verify --print-certs "out/Ariva-$V.apk" | grep -E 'SHA-256|DN' || true
+          BT="$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          "$ANDROID_HOME/build-tools/$BT/apksigner" verify --print-certs "out/Ariva-$V.apk" 2>&1 \
+            | grep -E 'certificate (DN|SHA-256)' || echo "::warning::apksigner could not read the signer"
           ls -l out
 
       - name: Publish to the private repo
@@ -171,3 +172,20 @@ jobs:
 
           $INSTALL"
           fi
+
+      - name: Download link
+        # The GitHub Mobile "workflow run" push opens this run; put the APK
+        # one tap away. The links need GitHub sign-in (the repo is private),
+        # so they are safe to show in this public log.
+        env:
+          V: ${{ steps.version.outputs.version }}
+        run: |
+          if [ "$KIND" = release ]; then TAG="android-v$V"; else TAG=android-latest; fi
+          APK_URL="https://github.com/$SOURCE_REPO/releases/download/$TAG/Ariva-$V.apk"
+          PAGE_URL="https://github.com/$SOURCE_REPO/releases/tag/$TAG"
+          echo "::notice title=Ariva $V APK ready::$APK_URL"
+          {
+            echo "## ⬇️ [Download Ariva-$V.apk]($APK_URL)"
+            echo
+            echo "Release page: [$TAG]($PAGE_URL)"
+          } >> "$GITHUB_STEP_SUMMARY"
