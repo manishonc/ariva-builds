@@ -190,17 +190,29 @@ jobs:
           V: ${{ steps.version.outputs.version }}
           SHA: ${{ steps.version.outputs.sha }}
         run: |
+          # GitHub's API 502s now and then, mid-create; clean up any half-made
+          # release and try again rather than leaving no release at all.
+          create_release() {
+            local tag="$1" i
+            for i in 1 2 3; do
+              create_release "$@" && return 0
+              echo "::warning::release create failed (attempt $i); retrying"
+              gh release delete "$tag" --repo "$SOURCE_REPO" --yes --cleanup-tag 2>/dev/null || true
+              sleep $((i * 15))
+            done
+            return 1
+          }
           ASSETS=(out/*.apk out/*.sha256)
           INSTALL='Download the `.apk` on the phone and open it (allow installs from your browser or Files app once; Android 15 may ask to allow restricted settings). It is signed with the Ariva Messages release key, the same as local builds, so it installs over the current app and keeps the default-SMS role and pairing.'
           FAST="$(cat ../r2-notes.md 2>/dev/null || true)"
           if [ -n "$FAST" ]; then FAST=$'\n\n'"$FAST"; fi
           if [ "$KIND" = release ]; then
-            gh release create "messages-v$V" "${ASSETS[@]}" --repo "$SOURCE_REPO" \
+            create_release "messages-v$V" "${ASSETS[@]}" --repo "$SOURCE_REPO" \
               --target "$SHA" --title "Ariva Messages $V" --notes "$INSTALL$FAST" --generate-notes
           else
             # Recreate: the tag has to follow main.
             gh release delete messages-latest --repo "$SOURCE_REPO" --yes --cleanup-tag || true
-            gh release create messages-latest "${ASSETS[@]}" --repo "$SOURCE_REPO" \
+            create_release messages-latest "${ASSETS[@]}" --repo "$SOURCE_REPO" \
               --target "$SHA" --title "Ariva Messages (latest build)" --prerelease \
               --notes "Automatic build of ${SHA::7}, version $V.
 

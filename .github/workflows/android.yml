@@ -285,18 +285,30 @@ jobs:
           SHA: ${{ steps.version.outputs.sha }}
           MODE: ${{ steps.path.outputs.mode }}
         run: |
+          # GitHub's API 502s now and then, mid-create; clean up any half-made
+          # release and try again rather than leaving no release at all.
+          create_release() {
+            local tag="$1" i
+            for i in 1 2 3; do
+              create_release "$@" && return 0
+              echo "::warning::release create failed (attempt $i); retrying"
+              gh release delete "$tag" --repo "$SOURCE_REPO" --yes --cleanup-tag 2>/dev/null || true
+              sleep $((i * 15))
+            done
+            return 1
+          }
           ASSETS=(out/*.apk out/*.sha256 out/native-fingerprint.txt)
           INSTALL='Download the `.apk` on the phone and open it (allow installs from your browser or Files app once). It is signed with the standard Expo debug key, the same as local builds, so it installs over an existing Ariva build. arm64 only.'
           if [ "$MODE" = repack ]; then HOW="JS-only change: repacked onto the previous native build."; else HOW="Full native build."; fi
           FAST="$(cat ../r2-notes.md 2>/dev/null || true)"
           if [ -n "$FAST" ]; then FAST=$'\n\n'"$FAST"; fi
           if [ "$KIND" = release ]; then
-            gh release create "android-v$V" "${ASSETS[@]}" --repo "$SOURCE_REPO" \
+            create_release "android-v$V" "${ASSETS[@]}" --repo "$SOURCE_REPO" \
               --target "$SHA" --title "Ariva Android $V" --notes "$HOW $INSTALL$FAST" --generate-notes
           else
             # Recreate: the tag has to follow main.
             gh release delete android-latest --repo "$SOURCE_REPO" --yes --cleanup-tag || true
-            gh release create android-latest "${ASSETS[@]}" --repo "$SOURCE_REPO" \
+            create_release android-latest "${ASSETS[@]}" --repo "$SOURCE_REPO" \
               --target "$SHA" --title "Ariva Android (latest build)" --prerelease \
               --notes "Automatic build of ${SHA::7}, version $V. $HOW
 

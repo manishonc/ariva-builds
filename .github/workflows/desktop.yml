@@ -114,6 +114,18 @@ jobs:
           V: ${{ steps.version.outputs.version }}
           SHA: ${{ steps.version.outputs.sha }}
         run: |
+          # GitHub's API 502s now and then, mid-create; clean up any half-made
+          # release and try again rather than leaving no release at all.
+          create_release() {
+            local tag="$1" i
+            for i in 1 2 3; do
+              create_release "$@" && return 0
+              echo "::warning::release create failed (attempt $i); retrying"
+              gh release delete "$tag" --repo "$SOURCE_REPO" --yes --cleanup-tag 2>/dev/null || true
+              sleep $((i * 15))
+            done
+            return 1
+          }
           ASSETS=(apps/desktop/release/*.dmg apps/desktop/release/*.zip)
           INSTALL='Download the `.dmg`, drag **Ariva** to Applications. The build is ad-hoc signed, so clear quarantine once:
 
@@ -123,12 +135,12 @@ jobs:
           FAST="$(cat ../r2-notes.md 2>/dev/null || true)"
           if [ -n "$FAST" ]; then FAST=$'\n\n'"$FAST"; fi
           if [ "$KIND" = release ]; then
-            gh release create "desktop-v$V" "${ASSETS[@]}" --repo "$SOURCE_REPO" \
+            create_release "desktop-v$V" "${ASSETS[@]}" --repo "$SOURCE_REPO" \
               --target "$SHA" --title "Ariva macOS $V" --notes "$INSTALL$FAST" --generate-notes
           else
             # Recreate: the tag has to follow main.
             gh release delete desktop-latest --repo "$SOURCE_REPO" --yes --cleanup-tag || true
-            gh release create desktop-latest "${ASSETS[@]}" --repo "$SOURCE_REPO" \
+            create_release desktop-latest "${ASSETS[@]}" --repo "$SOURCE_REPO" \
               --target "$SHA" --title "Ariva macOS (latest build)" --prerelease \
               --notes "Automatic build of ${SHA::7}, version $V.
 
