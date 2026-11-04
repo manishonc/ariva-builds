@@ -183,7 +183,7 @@ jobs:
           if [ "$KIND" = release ]; then TAG="android-v$V"; else TAG=android-latest; fi
           APK_URL="https://github.com/$SOURCE_REPO/releases/download/$TAG/Ariva-$V.apk"
           PAGE_URL="https://github.com/$SOURCE_REPO/releases/tag/$TAG"
-          echo "::notice title=Ariva $V APK ready::$APK_URL"
+          echo "::notice title=Ariva Android $V APK ready::$APK_URL"
           {
             echo "## ⬇️ [Download Ariva-$V.apk]($APK_URL)"
             echo
