@@ -2,11 +2,14 @@
 
 Public build runner for Ariva. It contains **no app code** — workflows check out the private `manishonc/ariva` repo with a token, build, and publish the results back to *that* repo's releases. It exists only because public repos get free GitHub-hosted runner minutes (private-repo macOS minutes bill at 10x).
 
+It also builds the Docker images of VideoEngine (`manishonc/VideoEngine`, a separate private platform). Those workflows are `videoengine-*.yml` and push to a private GHCR package; see [`videoengine/README.md`](videoengine/README.md).
+
 | Workflow | Builds | Triggered by |
 |---|---|---|
 | `desktop.yml` | macOS desktop app (DMG/zip) → `desktop-latest` / `desktop-v*` | `repository_dispatch` `desktop-build` from the private repo, or Run workflow |
 | `android.yml` | Android APK of `apps/mobile` (Expo) → `android-latest` / `android-v*` | `repository_dispatch` `android-build` from the private repo, or Run workflow |
 | `messages.yml` | Ariva Messages APK (`apps/messaging/android`, native Kotlin SMS app) → `messages-latest` / `messages-v*` | `repository_dispatch` `messages-build` from the private repo, or Run workflow |
+| `videoengine-render.yml` | VideoEngine render worker image → private `ghcr.io/manishonc/videoengine-render` (`:main`, `:sha-*`) | `repository_dispatch` `videoengine-render-build` from VideoEngine, or Run workflow ([details](videoengine/README.md)) |
 
 Secret needed: `ARIVA_SOURCE_TOKEN` — fine-grained PAT on `manishonc/ariva` (contents: read & write).
 
