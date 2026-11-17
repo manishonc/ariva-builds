@@ -105,5 +105,9 @@ jobs:
           HOOK: ${{ secrets.DOKPLOY_RENDER_DEPLOY_HOOK }}
         run: |
           if [ -z "$HOOK" ]; then echo "No DOKPLOY_RENDER_DEPLOY_HOOK; skipping redeploy."; exit 0; fi
-          curl -fsS -X POST "$HOOK" -o /dev/null
+          # Dokploy answers 301 (not an error to curl -f) when it skips a deploy,
+          # so check for 200 and show its message.
+          CODE="$(curl -sS -X POST "$HOOK" -o hook-reply.json -w '%{http_code}')"
+          echo "Dokploy answered $CODE: $(cat hook-reply.json)"
+          [ "$CODE" = 200 ] || { echo "::error::Dokploy did not redeploy Render"; exit 1; }
           echo "Redeploy requested for $IMAGE:main (sha-${{ steps.src.outputs.sha }})." >> "$GITHUB_STEP_SUMMARY"
