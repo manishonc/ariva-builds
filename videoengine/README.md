@@ -1,8 +1,8 @@
 # VideoEngine builds
 
 VideoEngine (`manishonc/VideoEngine`, private) is a separate platform from Ariva. This repo builds
-its Docker images for the same reason it builds Ariva's apps: free GitHub-hosted runners. Builds
-also stay off the production server. This folder holds the docs. The workflows themselves have to
+its Docker images to save build cost: GitHub-hosted runners are free for a public repo, and the
+production server only pulls the finished image. This folder holds the docs. The workflows have to
 live in `.github/workflows/` (GitHub runs them only from there), and their names start with
 `videoengine-`.
 
@@ -12,46 +12,30 @@ live in `.github/workflows/` (GitHub runs them only from there), and their names
 
 ## Image and tags
 
-- `ghcr.io/manishonc/videoengine-render`, a **private** package. The image contains VideoEngine's
-  code, so it must never be made public. GitHub cannot make a public package private again.
-- `:main` is the latest build of `main`, and Dokploy pulls this tag.
-- `:sha-<commit>` is fixed for every build. Use it to roll back: set Dokploy's image to it and
-  deploy.
-- `:buildcache` is the layer cache. It lives in the private package, not the Actions cache,
-  because pull requests from forks can read the Actions cache of a public repo.
-- `:seed` is the owner's placeholder that proves the package exists (see below).
+- `ghcr.io/manishonc/videoengine-render` is **public** (owner's choice, 17 Nov 2026): anyone can
+  pull it, so the render worker's code is readable. It holds no secrets; the env lives in
+  Dokploy.
+- `:main` is the latest build, and Dokploy pulls this tag.
+- `:sha-<commit>` is fixed for every build. Roll back by setting Dokploy's image to it.
+- `:buildcache` is the layer cache.
 
-## One-time setup
+## Setup
 
-1. **Seed the package, private.** A package first pushed by this public repo's `GITHUB_TOKEN`
-   can come out public, so the workflow never creates it. It stops if `:seed` is missing or the
-   package can be pulled anonymously. On your own machine, with a classic PAT that has
-   `write:packages`:
+Secrets on this repo:
 
-   ```sh
-   docker login ghcr.io -u manishonc            # paste the PAT as the password
-   docker pull --platform linux/amd64 busybox:1.37
-   docker tag busybox:1.37 ghcr.io/manishonc/videoengine-render:seed
-   docker push ghcr.io/manishonc/videoengine-render:seed
-   ```
+| Secret | What |
+|---|---|
+| `VIDEOENGINE_SOURCE_TOKEN` | Fine-grained PAT on `manishonc/VideoEngine` only, **Contents: read**, to check out its code. |
+| `DOKPLOY_RENDER_DEPLOY_HOOK` | The Render app's deploy webhook URL (Dokploy → VideoEngine → Render → Deployments). Without it, the step is skipped. |
 
-   Then check the visibility on
-   https://github.com/users/manishonc/packages/container/package/videoengine-render (Package
-   settings). It must say **Private**.
-2. **Give this repo write access to the package.** Package settings → Manage Actions access →
-   add `manishonc/ariva-builds` with role **Write**.
-3. **Secrets on this repo:**
+On VideoEngine: `ARIVA_BUILDS_TOKEN`, a fine-grained PAT on `manishonc/ariva-builds` with
+**Contents: read and write**, so it can send the `repository_dispatch`.
 
-   | Secret | What |
-   |---|---|
-   | `VIDEOENGINE_SOURCE_TOKEN` | Fine-grained PAT on `manishonc/VideoEngine` only, **Contents: read**. Nothing is published back to VideoEngine. |
-   | `DOKPLOY_RENDER_DEPLOY_HOOK` | The Render app's deploy webhook URL (Dokploy → VideoEngine → Render → Deployments). Anyone with it can redeploy Render. Without it the step is skipped, and you deploy by hand. |
+The package must give this repo **Write** (package settings → Manage Actions access), because it
+was first pushed by hand.
 
-4. **Secret on VideoEngine:** `ARIVA_BUILDS_TOKEN`, a fine-grained PAT on
-   `manishonc/ariva-builds` with **Contents: read & write** (needed to send `repository_dispatch`).
-5. **Dokploy, the Render app (`videoengine-render-oedqbw`):** Provider → **Docker**. Docker Image
-   `ghcr.io/manishonc/videoengine-render:main`, Registry URL `ghcr.io`, Username `manishonc`,
-   Password: a classic PAT with only `read:packages` (GHCR does not take fine-grained PATs).
-   Keep Auto Deploy on, since the webhook needs it. Leave the env, the resource limits and
-   "Create Environment File" (off) as they are. Switching the provider also stops Dokploy
-   building Render on the server.
+Dokploy, the Render app: Provider → Docker, image `ghcr.io/manishonc/videoengine-render:main`,
+no registry login (the image is public), Auto Deploy on.
+
+Dokploy runs one deployment at a time. A redeploy requested while another app is building
+waits in the queue.
