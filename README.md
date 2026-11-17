@@ -10,6 +10,7 @@ It also builds the Docker images of VideoEngine (`manishonc/VideoEngine`, a sepa
 | `android.yml` | Android APK of `apps/mobile` (Expo) → `android-latest` / `android-v*` | `repository_dispatch` `android-build` from the private repo, or Run workflow |
 | `messages.yml` | Ariva Messages APK (`apps/messaging/android`, native Kotlin SMS app) → `messages-latest` / `messages-v*` | `repository_dispatch` `messages-build` from the private repo, or Run workflow |
 | `videoengine-render.yml` | VideoEngine render worker image → public `ghcr.io/manishonc/videoengine-render` (`:main`, `:sha-*`) | `repository_dispatch` `videoengine-render-build` from VideoEngine, or Run workflow ([details](videoengine/README.md)) |
+| `videoengine-agent.yml` | VideoEngine studio agent image → public `ghcr.io/manishonc/videoengine-agent` (`:main`, `:sha-*`) | `repository_dispatch` `videoengine-agent-build` from VideoEngine, or Run workflow ([details](videoengine/README.md)) |
 
 Secret needed: `ARIVA_SOURCE_TOKEN` — fine-grained PAT on `manishonc/ariva` (contents: read & write).
 

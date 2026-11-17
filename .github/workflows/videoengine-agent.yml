@@ -1,0 +1,92 @@
+name: VideoEngine Agent image build
+
+# Builds the VideoEngine studio agent image (apps/studio/agent/deployment/Dockerfile)
+# from the private manishonc/VideoEngine repo, pushes it to the PUBLIC GHCR
+# package ghcr.io/manishonc/videoengine-agent, then asks Dokploy to redeploy
+# the Agent app, which pulls the new :main. See videoengine/README.md.
+#
+# Public like videoengine-render: anyone can pull the image, and with it the
+# agent's code and instructions. It holds no secrets: the env (ANTHROPIC_API_KEY
+# and the rest) lives in Dokploy, and .dockerignore keeps .env files out.
+#
+# Triggered by VideoEngine (repository_dispatch) or by hand (Run workflow).
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or SHA of manishonc/VideoEngine to build'
+        default: main
+  repository_dispatch:
+    types: [videoengine-agent-build]
+
+concurrency:
+  group: videoengine-agent
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest # x86-64, the same as the server
+    timeout-minutes: 30
+    env:
+      # Inputs go through env + validation, never straight into shell text.
+      REF: ${{ github.event.inputs.ref || github.event.client_payload.ref }}
+      SOURCE_REPO: manishonc/VideoEngine
+      IMAGE: ghcr.io/manishonc/videoengine-agent
+    steps:
+      - name: Validate inputs
+        run: '[[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "bad ref"; exit 1; }'
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: manishonc/VideoEngine
+          ref: ${{ env.REF }}
+          token: ${{ secrets.VIDEOENGINE_SOURCE_TOKEN }}
+          path: src
+          # Nothing here pushes; keep the token out of src/.git/config.
+          persist-credentials: false
+
+      - name: Read commit
+        id: src
+        run: echo "sha=$(git -C src rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: src
+          file: src/apps/studio/agent/deployment/Dockerfile
+          platforms: linux/amd64
+          push: true
+          # One plain manifest per tag, no attestation entries.
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:main
+            ${{ env.IMAGE }}:sha-${{ steps.src.outputs.sha }}
+          labels: org.opencontainers.image.revision=${{ steps.src.outputs.sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
+
+      - name: Redeploy Agent on Dokploy
+        # The Agent app's deploy webhook (Deployments tab). With no image in
+        # the payload, Dokploy redeploys the configured image, :main.
+        env:
+          HOOK: ${{ secrets.DOKPLOY_AGENT_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$HOOK" ]; then echo "No DOKPLOY_AGENT_DEPLOY_HOOK; skipping redeploy."; exit 0; fi
+          # Dokploy answers 301 (not an error to curl -f) when it skips a deploy,
+          # so check for 200 and show its message.
+          CODE="$(curl -sS -X POST "$HOOK" -o hook-reply.json -w '%{http_code}')"
+          echo "Dokploy answered $CODE: $(cat hook-reply.json)"
+          [ "$CODE" = 200 ] || { echo "::error::Dokploy did not redeploy Agent"; exit 1; }
+          echo "Redeploy requested for $IMAGE:main (sha-${{ steps.src.outputs.sha }})." >> "$GITHUB_STEP_SUMMARY"
