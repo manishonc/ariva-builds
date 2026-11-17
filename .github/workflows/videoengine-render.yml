@@ -1,16 +1,13 @@
 name: VideoEngine Render image build
 
 # Builds the VideoEngine render worker image (apps/studio/render/deployment/Dockerfile)
-# from the private manishonc/VideoEngine repo and pushes it to the PRIVATE GHCR
-# package ghcr.io/manishonc/videoengine-render. Then it asks Dokploy to redeploy
+# from the private manishonc/VideoEngine repo, pushes it to the PUBLIC GHCR
+# package ghcr.io/manishonc/videoengine-render, then asks Dokploy to redeploy
 # the Render app, which pulls the new :main. See videoengine/README.md.
 #
-# The image holds VideoEngine's code, so it must never be public. A package
-# first created by GITHUB_TOKEN from this public repo can come out public, so
-# this workflow never creates the package: the owner seeds it, private, by
-# hand (videoengine/README.md), and the guard step stops the build if the
-# package is missing or can be pulled anonymously. The layer cache sits in the
-# same private package, not in the Actions cache (forks can read that here).
+# Public on purpose (owner's choice, 17 Nov 2026): anyone can pull the image,
+# and with it the render worker's code. It holds no secrets: the env lives in
+# Dokploy, and .dockerignore keeps .env files out.
 #
 # Triggered by VideoEngine (repository_dispatch) or by hand (Run workflow).
 on:
@@ -38,19 +35,10 @@ jobs:
       # Inputs go through env + validation, never straight into shell text.
       REF: ${{ github.event.inputs.ref || github.event.client_payload.ref }}
       SOURCE_REPO: manishonc/VideoEngine
-      PACKAGE: manishonc/videoengine-render
       IMAGE: ghcr.io/manishonc/videoengine-render
     steps:
       - name: Validate inputs
         run: '[[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "bad ref"; exit 1; }'
-
-      - name: Refuse a public image
-        # Anonymous pull tokens are only handed out for public packages.
-        run: |
-          if curl -fsS -o /dev/null "https://ghcr.io/token?scope=repository:$PACKAGE:pull"; then
-            echo "::error::$IMAGE can be pulled anonymously (public). Make it private before building."
-            exit 1
-          fi
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -70,15 +58,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Refuse to create the package
-        # The seed tag exists only if the owner created the package (private)
-        # and gave this repo write access; otherwise a push would create it.
-        run: |
-          docker buildx imagetools inspect "$IMAGE:seed" > /dev/null || {
-            echo "::error::$IMAGE:seed not found. Seed the private package first (videoengine/README.md)."
-            exit 1
-          }
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -105,5 +84,9 @@ jobs:
           HOOK: ${{ secrets.DOKPLOY_RENDER_DEPLOY_HOOK }}
         run: |
           if [ -z "$HOOK" ]; then echo "No DOKPLOY_RENDER_DEPLOY_HOOK; skipping redeploy."; exit 0; fi
-          curl -fsS -X POST "$HOOK" -o /dev/null
+          # Dokploy answers 301 (not an error to curl -f) when it skips a deploy,
+          # so check for 200 and show its message.
+          CODE="$(curl -sS -X POST "$HOOK" -o hook-reply.json -w '%{http_code}')"
+          echo "Dokploy answered $CODE: $(cat hook-reply.json)"
+          [ "$CODE" = 200 ] || { echo "::error::Dokploy did not redeploy Render"; exit 1; }
           echo "Redeploy requested for $IMAGE:main (sha-${{ steps.src.outputs.sha }})." >> "$GITHUB_STEP_SUMMARY"
